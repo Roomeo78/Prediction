@@ -120,20 +120,18 @@ class CrossAttention(nn.Module):
 
 class Predict:
     def __init__(self, log_dir=None):
-
+        # --- Állítható modellparaméterek ---
+        t_depth = 4
+        t_heads = 16
+        isahp_depth = 8
         self.seq_len = 64
         self.max_events = 512
         self.feature_dim = 5
         self.embed_dim = 128
         self.sequence_window = deque(maxlen=self.seq_len + 1)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # --- Állítható modellparaméterek ---
-        t_depth = 4
-        t_heads = 16
-        isahp_depth = 8
-
         self.dropout_rate = 0.2
+        
         self.combination = 'multihead+concat'
         self.multihead = CrossAttention(embed_dim=self.embed_dim, n_heads=t_depth*t_heads, dropout=self.dropout_rate).to(self.device)
         self.model_T = TransformerModel(num_layers=t_depth, max_events=self.max_events, num_heads=t_heads, dropout=self.dropout_rate).to(self.device)
@@ -143,16 +141,7 @@ class Predict:
         self.loss_fn = nn.MSELoss()
         self.patience = 3
         self.total_epochs = 15
-        self.warmup_epochs = 5
-        #self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-6)
         self.optimizer = AdaBelief(self.model.parameters(), lr=1e-4, weight_decay=1e-6, eps=1e-16, weight_decouple=True, rectify=True, print_change_log=False)
-
-        def lr_lambda(epoch):
-            if epoch < self.warmup_epochs:
-                return epoch / self.warmup_epochs
-            return 0.5 * (1 + math.cos((epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs) * math.pi))
-
-        #self.scheduler = LambdaLR(self.optimizer, lr_lambda)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=self.patience, factor=0.1)
         self.initial_lr = self.optimizer.param_groups[0]['lr']
         self.train_data = []
@@ -166,6 +155,7 @@ class Predict:
         self.last_processed_layer = 0
         self.global_epoch = 0
         self.global_step = 0
+        
     def load_best_model(self):
         try:
             self.model.load_state_dict(torch.load(self.model_save_path, map_location=self.device))
@@ -175,52 +165,80 @@ class Predict:
             print("No saved model found. Starting from scratch.")
 
     def pad_batch(self, batch):
+        """
+        Paddolja az eseményláncokat, és maszkot készít az érvényes események jelölésére.
+        """
         padded = torch.zeros(self.max_events, self.feature_dim, dtype=torch.float32)
         mask = torch.zeros(self.max_events, dtype=torch.bool)
         num_events = min(len(batch), self.max_events)
         if num_events > 0:
-            stacked = torch.stack([torch.tensor(event, dtype=torch.float32) for event in batch[:num_events]])
+            stacked = torch.tensor(batch[:num_events], dtype=torch.float32)  # Egyszerűsítés: közvetlen tensor konverzió
             padded[:num_events] = stacked
             mask[:num_events] = 1
         return padded, mask
 
     def create_matrix(self, x, mask):
+        """
+        Átalakítja az eseményláncot egy mátrixszá, amely figyelembe veszi a delta értékeket és az események attribútumait.
+        """
         x = x.squeeze(0)
         mask = mask.squeeze(0)
         T, E = x.shape[:2]
         t_idx = torch.arange(T).unsqueeze(1).expand(-1, E)
         e_idx = torch.arange(E).unsqueeze(0).expand(T, -1)
-        f0, f1, f2, f3, f4, t_valid, e_valid = x[..., 0][mask], x[..., 1][mask], x[..., 2][mask], x[..., 3][mask], x[..., 4][mask], t_idx[mask], e_idx[mask]
-        df = pd.DataFrame({'row': list(zip(f1.cpu().numpy(), f2.cpu().numpy())), 'col': list(zip(t_valid.cpu().numpy(), f4.cpu().numpy())), 'value': f3.cpu().numpy()})
-        unique_rows, unique_cols = {k: i for i, k in enumerate(df['row'].unique())}, {k: i for i, k in enumerate(df['col'].unique())}
-        row_map, col_map, values = torch.tensor(df['row'].map(unique_rows).to_numpy(), dtype=torch.long), torch.tensor(df['col'].map(unique_cols).to_numpy(), dtype=torch.long), torch.tensor(df['value'].to_numpy(), dtype=torch.float32)
+    
+        f0, f1, f2, f3, f4, t_valid, e_valid = (
+            x[..., 0][mask], x[..., 1][mask], x[..., 2][mask],
+            x[..., 3][mask], x[..., 4][mask], t_idx[mask], e_idx[mask]
+        )
+    
+        df = pd.DataFrame({
+            'row': list(zip(f1.cpu().numpy(), f2.cpu().numpy())),
+            'col': list(zip(t_valid.cpu().numpy(), f4.cpu().numpy())),
+            'value': f3.cpu().numpy()
+        })
+    
+        unique_rows = {k: i for i, k in enumerate(df['row'].unique())}
+        unique_cols = {k: i for i, k in enumerate(df['col'].unique())}
+    
+        row_map = torch.tensor(df['row'].map(unique_rows).to_numpy(), dtype=torch.long)
+        col_map = torch.tensor(df['col'].map(unique_cols).to_numpy(), dtype=torch.long)
+        values = torch.tensor(df['value'].to_numpy(), dtype=torch.float32)
+    
         indices = torch.stack([row_map, col_map], dim=0)
         shape = (len(unique_rows), len(unique_cols))
-        adj_mat = torch.sparse_coo_tensor(indices, values, size=shape)
-        adj_mat = adj_mat.to_dense()
+        adj_mat = torch.sparse_coo_tensor(indices, values, size=shape).to_dense()
+    
         return adj_mat, f0, f1, f2, f3, f4, t_valid, e_valid, row_map
-
+    
     def rebuild_tensor_from_attention(self, attn_output, f0, f1, f3, f2, f4, t_valid, e_valid, row_map, target_shape=(1, 128, 512, 5)):
+        """
+        Az attention kimenetét visszaalakítja az eredeti tensor formátumába, figyelembe véve az attribútumokat.
+        """
         device = attn_output.device
         B, T, E, F = target_shape
         output_tensor = torch.zeros((B, T, E, F), device=device)
+    
         if not hasattr(self, "attention_projection"):
             self.attention_projection = nn.Linear(attn_output.shape[-1], F, bias=False).to(device)
+    
         with torch.no_grad():
-            attn_output = self.attention_projection(attn_output)
-            attn_output = attn_output.squeeze(0)
+            attn_output = self.attention_projection(attn_output).squeeze(0)
             for i in range(attn_output.shape[0]):
                 indices = (row_map == i).nonzero(as_tuple=True)[0]
                 for j in indices:
                     t, e = t_valid[j].item(), e_valid[j].item()
-                    output_tensor[0, t, e, 0] = attn_output[i, 3]
-                    output_tensor[0, t, e, 1] = f1[j]
-                    output_tensor[0, t, e, 2] = f2[j]
-                    output_tensor[0, t, e, 3] = f3[j]
-                    output_tensor[0, t, e, 4] = f4[j]
+                    output_tensor[0, t, e, 0] = attn_output[i, 3]  # Delta
+                    output_tensor[0, t, e, 1] = f1[j]              # Price
+                    output_tensor[0, t, e, 2] = f2[j]              # Entry ID
+                    output_tensor[0, t, e, 3] = f3[j]              # Delta (redundancia csökkentése)
+                    output_tensor[0, t, e, 4] = f4[j]              # Side
         return output_tensor
-
+    
     def process_layer(self):
+        """
+        Az eseményláncok feldolgozása, figyelembe véve a szabályok érvényesítését és az adat előkészítést.
+        """
         while True:
             if self.layer == self.last_processed_layer:
                 self.layer += 1
@@ -233,10 +251,14 @@ class Predict:
                         if len(raw_rows) == 0:
                             i += 1
                             continue
-                        processed_rows = [[event[0] / 100, event[1] / 100_000, event[2] / 1_000, event[3] / 10_000_000, event[4]] for event in raw_rows]
+                        processed_rows = [[
+                            event[0] / 100, event[1] / 100_000, event[2] / 1_000,
+                            event[3] / 10_000_000, event[4]
+                        ] for event in raw_rows]
                         self.sequence_window.append(processed_rows)
                         collected += 1
                         i += 1
+    
                     input_batches, input_masks, target_batches = [], [], []
                     for t in range(self.seq_len):
                         input_padded, input_mask = self.pad_batch(self.sequence_window[t])
@@ -244,42 +266,36 @@ class Predict:
                         input_batches.append(input_padded)
                         input_masks.append(input_mask)
                         target_batches.append(target_padded)
-                    #next_batch = [[token[0], token[1], token[2], token[3], token[4]] for token in self.sequence_window[-1]]
-                    #print(f"Cél érték next_batch: {next_batch}")
+    
                     input_tensor = torch.stack(input_batches).unsqueeze(0).to(self.device)
                     input_mask_tensor = torch.stack(input_masks).unsqueeze(0).to(self.device)
                     target_tensor = torch.stack(target_batches).unsqueeze(0).to(self.device)
+    
                     if self.combination == "multihead+concat":
                         adj_mat, f0, f1, f2, f3, f4, t_valid, e_valid, row_map = self.create_matrix(input_tensor, input_mask_tensor)
                         query = adj_mat.unsqueeze(0)
                         attn_output = self.multihead(query, query, query)
                         input_tensor = self.rebuild_tensor_from_attention(
-                            attn_output,
-                            f0, f1, f2, f3, f4, t_valid, e_valid, row_map,
+                            attn_output, f0, f1, f2, f3, f4, t_valid, e_valid, row_map,
                             target_shape=input_tensor.shape
                         )
+    
                     self.predict(input_tensor, input_mask_tensor)
-                    if len(self.val_data) == 0:
-                        self.val_data.append((input_tensor, input_mask_tensor, target_tensor))
-                    elif len(self.train_data) < 10 or random.random() < 0.8:
-                        if not any(torch.equal(input_tensor, item[0]) and torch.equal(input_mask_tensor, item[1]) and torch.equal(target_tensor, item[2]) for item in self.train_data):
-                            self.train_data.append((input_tensor, input_mask_tensor, target_tensor))
-                        else:
-                            if not any(torch.equal(input_tensor, item[0]) and torch.equal(input_mask_tensor, item[1]) and torch.equal(target_tensor, item[2]) for item in self.val_data):
-                                self.val_data.append((input_tensor, input_mask_tensor, target_tensor))
-                    else:
-                        if not any(torch.equal(input_tensor, item[0]) and torch.equal(input_mask_tensor, item[1]) and torch.equal(target_tensor, item[2]) for item in self.val_data):
-                            self.val_data.append((input_tensor, input_mask_tensor, target_tensor))
-                        else:
-                            pass
+    
+                    # Adatok validációs és tréning halmazba rendezése
+                    for dataset, condition in [(self.train_data, random.random() < 0.8), (self.val_data, True)]:
+                        if condition:
+                            dataset.append((input_tensor, input_mask_tensor, target_tensor))
+    
+                    # Tanító és validációs adatok kezelése
                     if len(self.train_data) > 5 and len(self.val_data) > 1:
                         self.train()
                         self.train_data = []
                         self.val_data = []
                         self.corect_layer += 1
                         self.last_processed_layer = self.corect_layer
-            self.layer = self.last_processed_layer
-
+                self.layer = self.last_processed_layer
+                
     def predict(self, input_tensor, input_mask_tensor):
         self.model.eval()
         with torch.no_grad():
@@ -343,55 +359,125 @@ class Predict:
         all_mae = torch.abs(pred - targ)
         results["overall_mae"] = all_mae.mean().item()
 
+        # Szabályok megszegésének aránya
+        invalid_side = torch.sum((side != 1) & (side != 2)).item()
+        non_decreasing_delta = torch.sum(delta[1:] >= delta[:-1]).item()
+        results["invalid_side_ratio"] = invalid_side / predictions.numel()
+        results["non_decreasing_delta_ratio"] = non_decreasing_delta / predictions.numel()
+
         return results
 
     def build_token_map(self, batch_input):
+        """
+        Tokenek attribútumainak leképezése.
+        Az entry_id-k alapján hozzárendeli a f0, f1, f4 értékeket, és ellenőrzi azok konzisztenciáját.
+        """
         f0, f1, f2, f3, f4 = torch.chunk(batch_input, 5, dim=-1)
         token_map = {}  # f2 → {fix f2->f0, fix f2->f1, fix f2->f4}
-        f0_flat, f1_flat, f2_flat, f3_flat, f4_flat = f0.view(-1), f1.view(-1), f2.view(-1), f3.view(-1), f4.view(-1)
+        
+        f0_flat, f1_flat, f2_flat, f3_flat, f4_flat = (
+            f0.view(-1), f1.view(-1), f2.view(-1), f3.view(-1), f4.view(-1)
+        )
+        
         for idx in range(f2_flat.shape[0]):
             entry_id = f2_flat[idx].item()
             if entry_id not in token_map:
-                token_map[entry_id] = {'f0': f0_flat[idx].item(), 'f1': f1_flat[idx].item(), 'f4': f4_flat[idx].item()}
-        print(f"token_map: {token_map}")
+                token_map[entry_id] = {
+                    'f0': f0_flat[idx].item(),
+                    'f1': f1_flat[idx].item(),
+                    'f4': f4_flat[idx].item()
+                }
+            else:
+                # Ellenőrzés: az entry_id-hez rendelt értékek azonosak maradnak
+                if (token_map[entry_id]['f0'] != f0_flat[idx].item() or
+                    token_map[entry_id]['f1'] != f1_flat[idx].item() or
+                    token_map[entry_id]['f4'] != f4_flat[idx].item()):
+                    raise ValueError(
+                        f"Inconsistent values for entry_id {entry_id}: "
+                        f"Expected {token_map[entry_id]}, but got "
+                        f"f0={f0_flat[idx].item()}, f1={f1_flat[idx].item()}, f4={f4_flat[idx].item()}"
+                    )
+        
+        print(f"Token map successfully built: {token_map}")
         return token_map
 
     def select_predicted_f0(self, model_output, token_map):
-        f0_pred = model_output[:, :, 0]
-        f2_list = {}
+        """
+        Az előrejelzett f0 értékek kiválasztása a token_map alapján.
+        Minden entry_id-hez megkeresi a hozzá tartozó f0 értékeket a model_output-ból.
+        """
+        f0_pred = model_output[:, :, 0]  # Az f0 az első dimenzióban van
+        f2_pred = model_output[:, :, 2]  # Az entry_id azonosító
+        f2_list = {}  # entry_id -> előrejelzett f0 értékek
+    
+        # Iterálás az entry_id-k és azok értékei alapján
         for entry_id, values in token_map.items():
-            f0_value = values['f0']
-            indices = [i for i, entry in enumerate(f0_value) if entry == entry_id]
-            f2_list[entry_id] = f0_pred[indices]
+            indices = (f2_pred == entry_id).nonzero(as_tuple=True)
+            if indices[0].numel() > 0:  # Ha van érvényes index
+                f0_values = f0_pred[indices]
+                f2_list[entry_id] = f0_values
+            else:
+                print(f"Warning: No predicted values found for entry_id {entry_id}")
+        
         return f2_list
 
     def custom_loss_fn(self, model_output, original_input):
         token_map = self.build_token_map(original_input)
         f2_list = self.select_predicted_f0(model_output, token_map)
-        f3_pred = model_output[:, :, 3]
         loss = 0.0
-        for entry_id, values in f2_list.items():
-            f0_list = values['f0']
-            f1_list = values['f1']
-            f4_list = values['f4']
-            f2_tensor = torch.tensor(f0_list, f1_list, f4_list, f3_pred)
-            loss = self.loss_fn(model_output, f2_tensor)
+    
+        # Szabály 1: entry_id-hoz rendelt értékek konzisztenciája
+        for entry_id, values in token_map.items():
+            f0, f1, f4 = values['f0'], values['f1'], values['f4']
+            predicted_f0 = f2_list[entry_id]
+            # Büntetés, ha az előrejelzett értékek eltérnek az eredeti token értékektől
+            loss += torch.mean((predicted_f0 - f0) ** 2)
+    
+        # Szabály 2: Delta pozitív és csökkenő
+        for i in range(1, model_output.shape[1]):
+            delta_prev = model_output[:, i-1, 3]
+            delta_curr = model_output[:, i, 3]
+            if not torch.all(delta_curr < delta_prev):
+                loss += torch.sum((delta_curr - delta_prev).clamp(min=0))
+    
+        # Szabály 3: Side értékek ellenőrzése
+        side = model_output[:, :, 4]
+        price = model_output[:, :, 1]
+        # Ellenőrzés, hogy side csak 1 vagy 2 lehet
+        if not torch.all((side == 1) | (side == 2)):
+            side_penalty = torch.sum((side != 1) & (side != 2))  # Invalid side values
+            loss += side_penalty * 0.1
+        # Logikai ellenőrzés a price alapján
+        for t in range(1, side.shape[1]):
+            max_price_1 = torch.max(price[:, :t][side[:, :t] == 1])
+            min_price_2 = torch.min(price[:, :t][side[:, :t] == 2])
+            for batch, s in enumerate(side[:, t]):
+                if s == 1 and price[batch, t] <= max_price_1:
+                    loss += 1.0
+                elif s == 2 and price[batch, t] >= min_price_2:
+                    loss += 1.0
+    
         return loss
 
     def teach(self, input_tensor, input_mask_tensor, target_tensor):
         transformer_out = self.model_T(input_tensor, input_mask_tensor)
-        #f0, f1, f2, f3, f4 = [input_tensor[..., i] for i in range(5)]
-        #new_f0 = transformer_out[..., 0]
-        #combined = torch.stack([new_f0, f1, f2, f3, f4], dim=-1)
         target_lstm = target_tensor.mean(dim=2)
         input_lstm = target_lstm[:, :-1, :]
         target_lstm_out = target_lstm[:, 1:, :]
         mask_lstm = input_mask_tensor[:, :-1, :].any(dim=2)
         isahp_out = self.model_I(input_lstm, mask_lstm)
-        #loss = self.custom_loss_fn(combined, input_tensor)
+    
+        # Alap veszteségek
         loss_T = self.loss_fn(transformer_out, target_tensor)
         loss_I = self.loss_fn(isahp_out, target_lstm_out)
-        loss = loss_I + loss_T
+    
+        # Szabály alapú veszteség
+        rule_loss = self.custom_loss_fn(transformer_out, input_tensor)
+    
+        # Kombinált veszteség (szabályok figyelembevételével)
+        alpha, beta = 0.5, 0.5  # Súlyozási faktorok
+        loss = alpha * (loss_I + loss_T) + beta * rule_loss
+    
         return loss, isahp_out, target_lstm_out
 
     def train(self):
