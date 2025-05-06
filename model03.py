@@ -2,18 +2,10 @@ import torch
 import torch.nn as nn
 import h5py
 import random
-import torch.optim as optim
 from adabelief_pytorch import AdaBelief
 from collections import deque
 import pandas as pd
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import time
-import tensorboard
 from torch.utils.tensorboard import SummaryWriter
-import os
-import datetime
-import math
-from torch.optim.lr_scheduler import LambdaLR
 
 class ISAHpModel(nn.Module):
     def __init__(self, input_dim=5, hidden_dim=256, output_dim=5, num_layers=2, dropout=0.2):
@@ -57,54 +49,25 @@ class TransformerModel(nn.Module):
         return out.view(B, T, E, F)
 
 class CombinedModel(nn.Module):
-    def __init__(self, transformer: TransformerModel, isahp: ISAHpModel, method='concat'):
+    def __init__(self, transformer: TransformerModel, isahp: ISAHpModel):
         super().__init__()
         self.transformer = transformer
         self.isahp = isahp
         transformer_out_dim = transformer.output_proj.out_features
-        self.method = method
-        if method == 'concat+linear_attn':
-            self.attention = nn.Linear(transformer.output_proj.out_features, 1)
-            isahp_in_dim = isahp.input_dim + transformer_out_dim
-            self.combined_isahp = ISAHpModel(input_dim=isahp_in_dim, hidden_dim=isahp.hidden_dim,
-                                             output_dim=isahp.output_dim, num_layers=isahp.lstm.num_layers,
-                                             dropout=isahp.dropout.p)
-        elif method == 'concat+multihead':
-            self.attention = nn.MultiheadAttention(embed_dim=transformer_out_dim, num_heads=1, batch_first=True)
-            isahp_in_dim = isahp.input_dim + transformer_out_dim
-            self.combined_isahp = ISAHpModel(input_dim=isahp_in_dim, hidden_dim=isahp.hidden_dim,
-                                             output_dim=isahp.output_dim, num_layers=isahp.lstm.num_layers,
-                                             dropout=isahp.dropout.p)
+        self.attention = nn.Linear(transformer.output_proj.out_features, 1)
+        isahp_in_dim = isahp.input_dim + transformer_out_dim
+        self.combined_isahp = ISAHpModel(input_dim=isahp_in_dim, hidden_dim=isahp.hidden_dim,
+                                         output_dim=isahp.output_dim, num_layers=isahp.lstm.num_layers,
+                                         dropout=isahp.dropout.p)
 
-        elif method == 'multihead+concat':
-            self.attention = nn.Linear(transformer.output_proj.out_features, 1)
-            isahp_in_dim = isahp.input_dim + transformer_out_dim
-            self.combined_isahp = ISAHpModel(input_dim=isahp_in_dim, hidden_dim=isahp.hidden_dim,
-                                             output_dim=isahp.output_dim, num_layers=isahp.lstm.num_layers,
-                                             dropout=isahp.dropout.p)
     def forward(self, x, mask):
         transformer_out = self.transformer(x, mask)
-        if self.method == 'concat+linear_attn':
-            attention_weights = torch.softmax(self.attention(transformer_out), dim=2)
-            attended_output = torch.sum(attention_weights * transformer_out, dim=2)
-            x_lstm = x.mean(dim=2)
-            combined_input = torch.cat((x_lstm, attended_output), dim=-1)
-            mask_lstm = mask.any(dim=2)
-            return self.combined_isahp(combined_input, mask_lstm)
-        elif self.method == 'concat+multihead':
-            transformer_out = transformer_out.squeeze(0)
-            attn_output, _ = self.attention(transformer_out, transformer_out, transformer_out)
-            x_lstm = x.mean(dim=0)
-            combined_input = torch.cat((x_lstm, attn_output), dim=-1)
-            mask_lstm = mask.any(dim=2)
-            return self.combined_isahp(combined_input, mask_lstm)
-        elif self.method == 'multihead+concat':
-            attention_weights = torch.softmax(self.attention(transformer_out), dim=2)
-            attended_output = torch.sum(attention_weights * transformer_out, dim=2)
-            x_lstm = x.mean(dim=2)
-            combined_input = torch.cat((x_lstm, attended_output), dim=-1)
-            mask_lstm = mask.any(dim=2)
-            return self.combined_isahp(combined_input, mask_lstm)
+        attention_weights = torch.softmax(self.attention(transformer_out), dim=2)
+        attended_output = torch.sum(attention_weights * transformer_out, dim=2)
+        x_lstm = x.mean(dim=2)
+        combined_input = torch.cat((x_lstm, attended_output), dim=-1)
+        mask_lstm = mask.any(dim=2)
+        return self.combined_isahp(combined_input, mask_lstm)
 
 class CrossAttention(nn.Module):
     def __init__(self, embed_dim=256, n_heads=4, dropout=0.2):
@@ -131,30 +94,39 @@ class Predict:
         self.sequence_window = deque(maxlen=self.seq_len + 1)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dropout_rate = 0.2
-        
-        self.combination = 'multihead+concat'
-        self.multihead = CrossAttention(embed_dim=self.embed_dim, n_heads=t_depth*t_heads, dropout=self.dropout_rate).to(self.device)
-        self.model_T = TransformerModel(num_layers=t_depth, max_events=self.max_events, num_heads=t_heads, dropout=self.dropout_rate).to(self.device)
-        self.model_I = ISAHpModel(num_layers=isahp_depth, dropout=self.dropout_rate).to(self.device)
-        self.model = CombinedModel(self.model_T, self.model_I, method=self.combination).to(self.device)
-        self.writer = SummaryWriter(log_dir=log_dir)
-        self.loss_fn = nn.MSELoss()
+        self.max_grad_norm = 5.0
         self.patience = 3
         self.total_epochs = 15
-        self.optimizer = AdaBelief(self.model.parameters(), lr=1e-4, weight_decay=1e-6, eps=1e-16, weight_decouple=True, rectify=True, print_change_log=False)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=self.patience, factor=0.1)
+        self.learn_rate = 1e-4
+        self.factor = 0.1
+        self.batch_size = 8
+
+        self.multihead = CrossAttention(embed_dim=self.embed_dim, n_heads=t_depth * t_heads, dropout=self.dropout_rate).to(self.device)
+        self.model_T = TransformerModel(num_layers=t_depth, max_events=self.max_events, num_heads=t_heads, dropout=self.dropout_rate).to(self.device)
+        self.model_I = ISAHpModel(num_layers=isahp_depth, dropout=self.dropout_rate).to(self.device)
+        self.model = CombinedModel(self.model_T, self.model_I).to(self.device)
+
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.loss_fn = nn.MSELoss()
+
+        self.optimizer = AdaBelief(self.model.parameters(), lr=self.learn_rate, weight_decay=1e-6, eps=1e-16, weight_decouple=True, rectify=True, print_change_log=False)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=self.patience, factor=self.factor)
         self.initial_lr = self.optimizer.param_groups[0]['lr']
+
         self.train_data = []
         self.val_data = []
+        self.token_map = {}
+
         self.best_loss = float('inf')
         self.best_epoch = 0
-        self.model_save_path = f"{self.combination}best_model.pt"
-        self.load_best_model()
         self.layer = 0
         self.corect_layer = 0
         self.last_processed_layer = 0
         self.global_epoch = 0
         self.global_step = 0
+
+        self.model_save_path = f"multi_concat_model.pt"
+        self.load_best_model()
         
     def load_best_model(self):
         try:
@@ -187,16 +159,9 @@ class Predict:
         t_idx = torch.arange(T).unsqueeze(1).expand(-1, E)
         e_idx = torch.arange(E).unsqueeze(0).expand(T, -1)
     
-        f0, f1, f2, f3, f4, t_valid, e_valid = (
-            x[..., 0][mask], x[..., 1][mask], x[..., 2][mask],
-            x[..., 3][mask], x[..., 4][mask], t_idx[mask], e_idx[mask]
-        )
+        f0, f1, f2, f3, f4, t_valid, e_valid = (x[..., 0][mask], x[..., 1][mask], x[..., 2][mask], x[..., 3][mask], x[..., 4][mask], t_idx[mask], e_idx[mask])
     
-        df = pd.DataFrame({
-            'row': list(zip(f1.cpu().numpy(), f2.cpu().numpy())),
-            'col': list(zip(t_valid.cpu().numpy(), f4.cpu().numpy())),
-            'value': f3.cpu().numpy()
-        })
+        df = pd.DataFrame({'row': list(zip(f1.cpu().numpy(), f2.cpu().numpy())), 'col': list(zip(t_valid.cpu().numpy(), f4.cpu().numpy())), 'value': f3.cpu().numpy()})
     
         unique_rows = {k: i for i, k in enumerate(df['row'].unique())}
         unique_cols = {k: i for i, k in enumerate(df['col'].unique())}
@@ -231,7 +196,7 @@ class Predict:
                     output_tensor[0, t, e, 0] = attn_output[i, 3]  # Delta
                     output_tensor[0, t, e, 1] = f1[j]              # Price
                     output_tensor[0, t, e, 2] = f2[j]              # Entry ID
-                    output_tensor[0, t, e, 3] = f3[j]              # Delta (redundancia csökkentése)
+                    output_tensor[0, t, e, 3] = f3[j]              # Delta
                     output_tensor[0, t, e, 4] = f4[j]              # Side
         return output_tensor
     
@@ -258,7 +223,6 @@ class Predict:
                         self.sequence_window.append(processed_rows)
                         collected += 1
                         i += 1
-    
                     input_batches, input_masks, target_batches = [], [], []
                     for t in range(self.seq_len):
                         input_padded, input_mask = self.pad_batch(self.sequence_window[t])
@@ -266,29 +230,21 @@ class Predict:
                         input_batches.append(input_padded)
                         input_masks.append(input_mask)
                         target_batches.append(target_padded)
-    
                     input_tensor = torch.stack(input_batches).unsqueeze(0).to(self.device)
                     input_mask_tensor = torch.stack(input_masks).unsqueeze(0).to(self.device)
                     target_tensor = torch.stack(target_batches).unsqueeze(0).to(self.device)
-    
-                    if self.combination == "multihead+concat":
-                        adj_mat, f0, f1, f2, f3, f4, t_valid, e_valid, row_map = self.create_matrix(input_tensor, input_mask_tensor)
-                        query = adj_mat.unsqueeze(0)
-                        attn_output = self.multihead(query, query, query)
-                        input_tensor = self.rebuild_tensor_from_attention(
-                            attn_output, f0, f1, f2, f3, f4, t_valid, e_valid, row_map,
-                            target_shape=input_tensor.shape
-                        )
-    
+                    adj_mat, f0, f1, f2, f3, f4, t_valid, e_valid, row_map = self.create_matrix(input_tensor, input_mask_tensor)
+                    query = adj_mat.unsqueeze(0)
+                    attn_output = self.multihead(query, query, query)
+                    input_tensor = self.rebuild_tensor_from_attention(
+                        attn_output, f0, f1, f2, f3, f4, t_valid, e_valid, row_map,
+                        target_shape=input_tensor.shape
+                    )
                     self.predict(input_tensor, input_mask_tensor)
-    
-                    # Adatok validációs és tréning halmazba rendezése
                     for dataset, condition in [(self.train_data, random.random() < 0.8), (self.val_data, True)]:
                         if condition:
                             dataset.append((input_tensor, input_mask_tensor, target_tensor))
-    
-                    # Tanító és validációs adatok kezelése
-                    if len(self.train_data) > 5 and len(self.val_data) > 1:
+                    if len(self.train_data) > self.batch_size * 0.8 and len(self.val_data) > self.batch_size * 0.2:
                         self.train()
                         self.train_data = []
                         self.val_data = []
@@ -306,157 +262,109 @@ class Predict:
     def evaluate_model(self, predictions, targets):
         pred = predictions.detach().cpu()
         targ = targets.detach().cpu()
-
+        result_names = ["f0_time", "f1_price", "f2_entryid", "f3_delta", "f4_side"]
+        thresholds = [0.01, 0.0001, 0.001, 0.00005, 0.0]
         results = {}
-
-        # f0: time of first appearance (float), normalizált /100
-        f0_tol = 0.01  # 1 időegység
-        f0_diff = torch.abs(pred[..., 0] - targ[..., 0])
-        f0_acc = (f0_diff <= f0_tol).float().mean().item()
-        results["f0_time_mae"] = f0_diff.mean().item()
-        results["f0_time_mse"] = (f0_diff ** 2).mean().item()  # MSE hozzáadása
-        results["f0_time_acc"] = f0_acc
-
-        # f1: price, normalizált /100_000
-        f1_tol = 0.0001  # ~10 egységnyi tolerancia eredetiben
-        f1_diff = torch.abs(pred[..., 1] - targ[..., 1])
-        f1_acc = (f1_diff <= f1_tol).float().mean().item()
-        results["f1_price_mae"] = f1_diff.mean().item()
-        results["f1_price_mse"] = (f1_diff ** 2).mean().item()  # MSE hozzáadása
-        results["f1_price_acc"] = f1_acc
-
-        # f2: entry_id, diszkrét, normalizált /1000
-        f2_tol = 0.001  # pontos egyezést várunk
-        f2_diff = torch.abs(pred[..., 2] - targ[..., 2])
-        f2_acc = (f2_diff <= f2_tol).float().mean().item()
-        results["f2_entryid_mae"] = f2_diff.mean().item()
-        results["f2_entryid_mse"] = (f2_diff ** 2).mean().item()  # MSE hozzáadása
-        results["f2_entryid_acc"] = f2_acc
-
-        # f3: delta, normalizált /10_000_000, min 8 számjegy → változások elég nagyok
-        f3_tol = 0.00005  # ~500 egység delta eredetiben
-        f3_diff = torch.abs(pred[..., 3] - targ[..., 3])
-        f3_acc = (f3_diff <= f3_tol).float().mean().item()
-        results["f3_delta_mae"] = f3_diff.mean().item()
-        results["f3_delta_mse"] = (f3_diff ** 2).mean().item()
-        results["f3_delta_acc"] = f3_acc
-
-        # f4: side, 1 vagy 2 → pontos egyezés kell
-        f4_pred = pred[..., 4].round()
-        f4_true = targ[..., 4]
-        f4_acc = (f4_pred == f4_true).to(torch.float32).mean().item()
-
-        results["f4_side_acc"] = f4_acc
-        results["f4_side_mae"] = torch.abs(f4_pred - f4_true).float().mean().item()
-        results["f4_side_mse"] = ((f4_pred - f4_true) ** 2).mean().item()
-        results["overall_acc"] = (f0_acc + f1_acc + f2_acc + f3_acc + f4_acc) / 5
-
-        # Általános MSE (összes jellemzőre)
-        all_diff = torch.abs(pred - targ)
-        results["overall_mse"] = (all_diff ** 2).mean().item()
-
-        # Általános MAE (összes jellemzőre)
-        all_mae = torch.abs(pred - targ)
-        results["overall_mae"] = all_mae.mean().item()
-
-        # Szabályok megszegésének aránya
-        invalid_side = torch.sum((side != 1) & (side != 2)).item()
-        non_decreasing_delta = torch.sum(delta[1:] >= delta[:-1]).item()
-        results["invalid_side_ratio"] = invalid_side / predictions.numel()
-        results["non_decreasing_delta_ratio"] = non_decreasing_delta / predictions.numel()
-
+        acc_values = []
+        for i, result_name in enumerate(result_names):
+            abs_diff = torch.abs(pred[..., i] - targ[..., i])
+            mae = abs_diff.mean().item()
+            mse = (abs_diff ** 2).mean().item()
+            acc = (abs_diff <= thresholds[i]).float().mean().item()
+            results[f"{result_name}_mae"] = mae
+            results[f"{result_name}_mse"] = mse
+            results[f"{result_name}_acc"] = acc
+            acc_values.append(acc)
+        results["overall_mae"] = torch.abs(pred - targ).mean().item()
+        results["overall_mse"] = (torch.abs(pred - targ) ** 2).mean().item()
+        results["overall_acc"] = sum(acc_values) / len(acc_values)
         return results
 
     def build_token_map(self, batch_input):
-        """
-        Tokenek attribútumainak leképezése.
-        Az entry_id-k alapján hozzárendeli a f0, f1, f4 értékeket, és ellenőrzi azok konzisztenciáját.
-        """
         f0, f1, f2, f3, f4 = torch.chunk(batch_input, 5, dim=-1)
-        token_map = {}  # f2 → {fix f2->f0, fix f2->f1, fix f2->f4}
-        
-        f0_flat, f1_flat, f2_flat, f3_flat, f4_flat = (
-            f0.view(-1), f1.view(-1), f2.view(-1), f3.view(-1), f4.view(-1)
-        )
-        
+        f0_flat, f1_flat, f2_flat, f3_flat, f4_flat = (f0.view(-1), f1.view(-1), f2.view(-1), f3.view(-1), f4.view(-1))
         for idx in range(f2_flat.shape[0]):
-            entry_id = f2_flat[idx].item()
-            if entry_id not in token_map:
-                token_map[entry_id] = {
-                    'f0': f0_flat[idx].item(),
-                    'f1': f1_flat[idx].item(),
-                    'f4': f4_flat[idx].item()
+            entry_id = int(round(f2_flat[idx].item() * 1000))
+            curr_vals = {'f0': f0_flat[idx].item(), 'f1': f1_flat[idx].item(), 'f4': f4_flat[idx].item()}
+            if entry_id not in self.token_map:
+                self.token_map[entry_id] = {'f0': curr_vals['f0'], 'f1': curr_vals['f1'], 'f4': curr_vals['f4']}
+            else:
+                stored_vals = self.token_map[entry_id]
+                curr_vals['f0'] = stored_vals['f0']
+                curr_vals['f1'] = stored_vals['f1']
+                curr_vals['f4'] = stored_vals['f4']
+                self.token_map[entry_id] = {'f0': stored_vals['f0'], 'f1': stored_vals['f1'], 'f4': stored_vals['f4']}
+
+    def select_predicted_f0(self, model_output):
+        f0_pred = model_output[:, :, 0]
+        f1_pred = model_output[:, :, 1]
+        f2_pred = model_output[:, :, 2]
+        f4_pred = model_output[:, :, 4]
+        predict_list = {}
+        loss = torch.tensor(0.0, device=f0_pred.device, requires_grad=True)
+        for entry_id, values in self.token_map.items():
+            indices = (f2_pred == entry_id).nonzero(as_tuple=True)
+            if indices[0].numel() > 0:
+                f0_values = f0_pred[indices]
+                f1_values = f1_pred[indices]
+                f4_values = f4_pred[indices]
+                predict_list[entry_id] = {
+                    'f0': f0_values.mean(),
+                    'f1': f1_values.mean(),
+                    'f4': f4_values.mean()
                 }
             else:
-                # Ellenőrzés: az entry_id-hez rendelt értékek azonosak maradnak
-                if (token_map[entry_id]['f0'] != f0_flat[idx].item() or
-                    token_map[entry_id]['f1'] != f1_flat[idx].item() or
-                    token_map[entry_id]['f4'] != f4_flat[idx].item()):
-                    raise ValueError(
-                        f"Inconsistent values for entry_id {entry_id}: "
-                        f"Expected {token_map[entry_id]}, but got "
-                        f"f0={f0_flat[idx].item()}, f1={f1_flat[idx].item()}, f4={f4_flat[idx].item()}"
-                    )
-        
-        print(f"Token map successfully built: {token_map}")
-        return token_map
+                fake_pred = {
+                    'f0': torch.tensor(0.0, device=f0_pred.device, requires_grad=True),
+                    'f1': torch.tensor(0.0, device=f0_pred.device, requires_grad=True),
+                    'f4': torch.tensor(0.0, device=f0_pred.device, requires_grad=True)
+                }
+                loss = loss + self.panalty(fake_pred, self.token_map[entry_id])
+        return predict_list, loss
 
-    def select_predicted_f0(self, model_output, token_map):
-        """
-        Az előrejelzett f0 értékek kiválasztása a token_map alapján.
-        Minden entry_id-hez megkeresi a hozzá tartozó f0 értékeket a model_output-ból.
-        """
-        f0_pred = model_output[:, :, 0]  # Az f0 az első dimenzióban van
-        f2_pred = model_output[:, :, 2]  # Az entry_id azonosító
-        f2_list = {}  # entry_id -> előrejelzett f0 értékek
-    
-        # Iterálás az entry_id-k és azok értékei alapján
-        for entry_id, values in token_map.items():
-            indices = (f2_pred == entry_id).nonzero(as_tuple=True)
-            if indices[0].numel() > 0:  # Ha van érvényes index
-                f0_values = f0_pred[indices]
-                f2_list[entry_id] = f0_values
-            else:
-                print(f"Warning: No predicted values found for entry_id {entry_id}")
-        
-        return f2_list
+    def panalty(self, predict, true, loss=None):
+        def apply_penalty(diff, thresholds, penalty_val):
+            penalty = torch.tensor(0.0, device=diff.device)
+            for scale in thresholds:
+                if torch.any(diff > torch.tensor(scale, device=diff.device)):
+                    penalty += penalty_val * (diff - scale).clamp(min=0)
+                    break
+            return penalty
+        if loss is None:
+            loss = torch.tensor(0.0, device=predict['f0'].device, requires_grad=True)
+        penalty_f0 = 30.0
+        penalty_group = 10.0
+        thresholds = [0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
+        f0_diff = torch.abs(predict['f0'] - true['f0'])
+        f1_diff = torch.abs(predict['f1'] - true['f1'])
+        f4_diff = torch.abs(predict['f4'] - true['f4'])
+        loss = loss + apply_penalty(f0_diff, thresholds, penalty_f0)
+        loss = loss + apply_penalty(f1_diff, thresholds, penalty_group)
+        loss = loss + apply_penalty(f4_diff, thresholds, penalty_group)
+        return loss
 
     def custom_loss_fn(self, model_output, original_input):
-        token_map = self.build_token_map(original_input)
-        f2_list = self.select_predicted_f0(model_output, token_map)
-        loss = 0.0
-    
-        # Szabály 1: entry_id-hoz rendelt értékek konzisztenciája
-        for entry_id, values in token_map.items():
-            f0, f1, f4 = values['f0'], values['f1'], values['f4']
-            predicted_f0 = f2_list[entry_id]
-            # Büntetés, ha az előrejelzett értékek eltérnek az eredeti token értékektől
-            loss += torch.mean((predicted_f0 - f0) ** 2)
-    
-        # Szabály 2: Delta pozitív és csökkenő
-        for i in range(1, model_output.shape[1]):
-            delta_prev = model_output[:, i-1, 3]
-            delta_curr = model_output[:, i, 3]
-            if not torch.all(delta_curr < delta_prev):
-                loss += torch.sum((delta_curr - delta_prev).clamp(min=0))
-    
-        # Szabály 3: Side értékek ellenőrzése
-        side = model_output[:, :, 4]
-        price = model_output[:, :, 1]
-        # Ellenőrzés, hogy side csak 1 vagy 2 lehet
-        if not torch.all((side == 1) | (side == 2)):
-            side_penalty = torch.sum((side != 1) & (side != 2))  # Invalid side values
-            loss += side_penalty * 0.1
-        # Logikai ellenőrzés a price alapján
-        for t in range(1, side.shape[1]):
-            max_price_1 = torch.max(price[:, :t][side[:, :t] == 1])
-            min_price_2 = torch.min(price[:, :t][side[:, :t] == 2])
-            for batch, s in enumerate(side[:, t]):
-                if s == 1 and price[batch, t] <= max_price_1:
-                    loss += 1.0
-                elif s == 2 and price[batch, t] >= min_price_2:
-                    loss += 1.0
-    
+        self.build_token_map(original_input)
+        predict_list, loss = self.select_predicted_f0(model_output)
+        known_ids = set(self.token_map.keys())
+        predicted_ids = set(predict_list.keys())
+        for entry_id, true_values in self.token_map.items():
+            if entry_id in predict_list:
+                pred_values = predict_list[entry_id]
+
+                mismatched = any([
+                    not torch.allclose(pred_values['f0'], true_values['f0'], atol=1e-3),
+                    not torch.allclose(pred_values['f1'], true_values['f1'], atol=1e-3),
+                    not torch.allclose(pred_values['f4'], true_values['f4'], atol=1e-3),
+                ])
+                if mismatched:
+                    loss = self.panalty(pred_values, true_values, loss)
+            else:
+                if predicted_ids:
+                    max_known = max(known_ids)
+                    max_predicted = max(predicted_ids)
+                    if max_predicted > max_known + len(predicted_ids - known_ids):
+                        loss = loss + 0.1
         return loss
 
     def teach(self, input_tensor, input_mask_tensor, target_tensor):
@@ -466,18 +374,11 @@ class Predict:
         target_lstm_out = target_lstm[:, 1:, :]
         mask_lstm = input_mask_tensor[:, :-1, :].any(dim=2)
         isahp_out = self.model_I(input_lstm, mask_lstm)
-    
-        # Alap veszteségek
         loss_T = self.loss_fn(transformer_out, target_tensor)
         loss_I = self.loss_fn(isahp_out, target_lstm_out)
-    
-        # Szabály alapú veszteség
         rule_loss = self.custom_loss_fn(transformer_out, input_tensor)
-    
-        # Kombinált veszteség (szabályok figyelembevételével)
-        alpha, beta = 0.5, 0.5  # Súlyozási faktorok
+        alpha, beta = 0.5, 0.5
         loss = alpha * (loss_I + loss_T) + beta * rule_loss
-    
         return loss, isahp_out, target_lstm_out
 
     def train(self):
@@ -494,11 +395,9 @@ class Predict:
                     if p.grad is not None:
                         total_norm += p.grad.data.norm(2).item() ** 2
                 total_norm = total_norm ** 0.5
-                print(f"Gradient norm: {total_norm:.6f}")
-                max_grad_norm = 5.0
-                if total_norm > max_grad_norm:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
-                    print(f"Gradient norm exceeded {max_grad_norm}, clipped to max.")
+                if total_norm > self.max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                print(f"Gradient norm: {total_norm:.6f}, clipped to max: {self.max_grad_norm}")
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 epoch_loss += loss.item()
@@ -521,9 +420,9 @@ class Predict:
                 self.best_loss = val_loss
                 self.best_epoch = epoch
                 torch.save(self.model.state_dict(), self.model_save_path)
-                print(f"Best_loss: {self.best_loss} SAVE MODEL")
+                print(f"\033[93m--- Best_loss: {self.best_loss} SAVE MODEL ---\033[0m")
             elif epoch - self.best_epoch >= self.patience:
-                print("Early stopping triggered.")
+                print("\033[94m--- Early stopping triggered. ---\033[0m")
                 break
             self.scheduler.step(val_loss)
             new_dropout = max(0.0, self.dropout_rate * (0.9 ** epoch))
